@@ -2,13 +2,16 @@
 #include <dji_vehicle.hpp>
 #include "common/dji_linux_helpers.hpp"
 
-#include "msg/juk_dji_gps_msg.h"
-#include "msg/juk_dji_device_status_msg.h"
-#include "msg/juk_dji_control_msg.h"
+#include "juk_dji_gps_msg.h"
+#include "juk_dji_device_status_msg.h"
+#include "juk_control_dji_msg.h"
 
 #include <iostream>
 #include <LinuxChrono.h>
 #include <ros/ros.h>
+
+
+#define DEBUG_ROS
 
 #define NO_DJI_HARDWARE
 
@@ -29,18 +32,21 @@ DJI::OSDK::Telemetry::Velocity       data_Velocity;
 DJI::OSDK::Telemetry::SDKInfo        data_Status;
 double                               data_Course;
 
-custom_msg::juk_dji_gps_msg msg_GPS;
-custom_msg::juk_dji_device_status_msg msg_device_status;
+juk_msg::juk_dji_gps_msg msg_GPS;
+juk_msg::juk_dji_device_status_msg msg_device_status;
 
 ros::Time last_ctrl_update_time;
 
+uint ctrl_flag = 3;
 
-void ctrl_callback(const custom_msg::juk_dji_control_msg::ConstPtr& msg)
+
+void ctrl_callback(const juk_msg::juk_control_dji_msg::ConstPtr& msg)
 {
 	last_ctrl_update_time = ros::Time::now();
-	current_ctrlData.x = msg->vx;
-	current_ctrlData.y = msg->vy;
-	current_ctrlData.z = msg->vz;
+	ctrl_flag = msg->flag;
+	current_ctrlData.x = msg->data_x;
+	current_ctrlData.y = msg->data_y;
+	current_ctrlData.z = msg->data_z;
 	
 	current_ctrlData.yaw = msg->course;
 }
@@ -71,7 +77,7 @@ void update_data()
 	t2 = (t2 < -1.0) ? -1.0 : t2;
 
 	  data_Course = atan2(t1, t0);
-#endif
+
 	msg_GPS.lat = data_GPS.latitude;
 	msg_GPS.lng = data_GPS.longitude;
 	msg_GPS.alt = data_GPS.altitude;
@@ -81,21 +87,51 @@ void update_data()
 	msg_GPS.vy = data_Velocity.data.y;
 	msg_GPS.vz = data_Velocity.data.z;
 	msg_GPS.course = data_Course;
-	const long max_mute_duration = 100000;
+	
+	#else 
+	msg_GPS.lat = 3.14/4;
+	msg_GPS.lng = 3.14 /3;
+	msg_GPS.alt = 200;
+	msg_GPS.quality = 1;
+	msg_GPS.satellites = 0;
+	msg_GPS.vx = 1;
+	msg_GPS.vy = 2;
+	msg_GPS.vz = 3;
+	msg_GPS.course = 3.14;
+	
+	data_RC.lb2.mode = F_MODE;
+	#endif
+	const long max_mute_duration = 500000000;
 	switch (data_RC.lb2.mode)
 	{
 	case F_MODE:
 		{
+			auto now = ros::Time::now();
 			#ifndef NO_DJI_HARDWARE
+			if ((now - last_ctrl_update_time).toNSec() > max_mute_duration || ctrl_flag == juk_msg::juk_control_dji_msg::FLAG_BREAK)
+			{
+				current_ctrlData = default_ctrlData;
+				v->control->emergencyBrake();
+			}
+				
+			else
+				v->control->flightCtrl(current_ctrlData);
+			
+			
+			
 			if (data_Status.deviceStatus != 2)
 			{
 				v->obtainCtrlAuthority();
-				msg_device_status.changeTime = ros::Time::now(); 
+				msg_device_status.changeTime = now; 
 			}
+					
 			
-			v->control->flightCtrl(current_ctrlData);
 			#endif
-			msg_device_status.authority = custom_msg::juk_dji_device_status_msg::CONTROL_BY_SDK;
+			msg_device_status.authority = juk_msg::juk_dji_device_status_msg::CONTROL_BY_SDK;
+			#ifdef DEBUG_ROS
+			cout<<"TIME: "<<(now - last_ctrl_update_time).toNSec()<<endl;
+			cout << "DATA: " << current_ctrlData.x << " " << current_ctrlData.y << " " << current_ctrlData.z << " " << endl;
+			#endif // !DEBUG_ROS
 			
 			
 		}
@@ -111,7 +147,7 @@ void update_data()
 			}
 			#endif
 			
-			msg_device_status.authority = custom_msg::juk_dji_device_status_msg::CONTROL_BY_RC;
+			msg_device_status.authority = juk_msg::juk_dji_device_status_msg::CONTROL_BY_RC;
 			msg_device_status.changeTime = ros::Time::now();
 		
 			break;
@@ -124,13 +160,12 @@ int main(int argc, char *argv[])
 {
 	cout << argv[0] << endl;
 	ros::init(argc, argv, "JUK_DJI_CORE_NODE");
-	ros::NodeHandle nh;
-	ros::NodeHandle nh_private("~");
+	ros::NodeHandle nh("~");
 	last_ctrl_update_time = ros::Time::now();
-	ros::Publisher pub_GPS = nh.advertise<custom_msg::juk_dji_gps_msg>("JUK/DJI/GPS", 1);
-	ros::Publisher pub_device_status = nh.advertise<custom_msg::juk_dji_device_status_msg>("JUK/DJI/DEVICE_STATUS", 1);
+	ros::Publisher pub_GPS = nh.advertise<juk_msg::juk_dji_gps_msg>("JUK/DJI/GPS", 1);
+	ros::Publisher pub_device_status = nh.advertise<juk_msg::juk_dji_device_status_msg>("JUK/DJI/DEVICE_STATUS", 1);
 	
-	ros::Subscriber sub = nh.subscribe("JUK/DJI/CONTROL", 1, ctrl_callback);
+	ros::Subscriber sub = nh.subscribe("JUK/CONTROL_DJI", 1, ctrl_callback);
 	
 #ifndef NO_DJI_HARDWARE
 	LinuxSetup ls(argc, argv); 
@@ -138,7 +173,7 @@ int main(int argc, char *argv[])
 	
 	auto st=v->broadcast->getStatus();
 
-	//===============Подписка на указанные темы==========//
+	//===============РџРѕРґРїРёСЃРєР° РЅР° СѓРєР°Р·Р°РЅРЅС‹Рµ С‚РµРјС‹==========//
 	ACK::ErrorCode subscribeStatus;
 	subscribeStatus = v->subscribe->verify(5000);
 
@@ -164,8 +199,13 @@ int main(int argc, char *argv[])
 
 	subscribeStatus = v->subscribe->startPackage(pkgIndex, 50000);
 #endif 
-	//==========Основной цикл==========//
+	//==========РћСЃРЅРѕРІРЅРѕР№ С†РёРєР»==========//
+	#ifdef DEBUG_ROS
+	ros::Rate r(5);
+	#else
 	ros::Rate r(50);
+	#endif // DEBUG_ROS
+
 	
 	while (ros::ok())
 	{
